@@ -25,7 +25,7 @@ import (
 	listers "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1"
 )
 
-const controllerAgentName = "cloudflare-gateway-api-controller"
+const controllerAgentName = "pokgak.xyz/cloudflare-gateway-api-controller"
 
 const (
 	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
