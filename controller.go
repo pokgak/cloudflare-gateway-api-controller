@@ -39,7 +39,7 @@ const (
 	MessageResourceExists = "Resource %q already exists and is not managed by Foo"
 	// MessageResourceSynced is the message used for an Event fired when a Foo
 	// is synced successfully
-	MessageResourceSynced = "Foo synced successfully"
+	MessageResourceSynced = "Resource synced successfully"
 )
 
 type Controller struct {
@@ -205,6 +205,11 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		}
 
 		return err
+	}
+
+	// skip update if no changes to the resource
+	if gc.Status.Conditions[len(gc.Status.Conditions)-1].ObservedGeneration == gc.Generation {
+		return nil
 	}
 
 	// Finally, we update the status block of the Foo resource to reflect the
