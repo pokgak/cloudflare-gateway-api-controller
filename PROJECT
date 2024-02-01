@@ -2,9 +2,22 @@
 # This file is used to track the info used to scaffold your project
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
-domain: pokgak.xyz
+domain: gateway.networking.k8s.io
 layout:
 - go.kubebuilder.io/v4
 projectName: cloudflare-gateway-api-controller
 repo: github.com/pokgak/cloudflare-gateway-api-controller
+resources:
+- controller: true
+  domain: gateway.networking.k8s.io
+  kind: GatewayClass
+  version: v1
+- controller: true
+  domain: gateway.networking.k8s.io
+  kind: Gateway
+  version: v1
+- controller: true
+  domain: gateway.networking.k8s.io
+  kind: HTTPRoute
+  version: v1
 version: "3"
