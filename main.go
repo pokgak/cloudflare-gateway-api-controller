@@ -44,7 +44,11 @@ func main() {
 
 	informerFactory := informers.NewSharedInformerFactory(clientset, time.Second*30)
 
-	controller := NewController(ctx, kubeClient, clientset, informerFactory.Gateway().V1().GatewayClasses())
+	controller := NewController(
+		ctx, kubeClient, clientset, 
+		informerFactory.Gateway().V1().GatewayClasses(),
+		informerFactory.Gateway().V1().Gateways(),
+	)
 	informerFactory.Start(ctx.Done())
 
 	if err = controller.Run(ctx, 2); err != nil {

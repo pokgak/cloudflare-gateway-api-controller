@@ -48,6 +48,8 @@ type Controller struct {
 
 	gatewayClassLister listers.GatewayClassLister
 	gatewayClassSynced cache.InformerSynced
+	gatewayLister      listers.GatewayLister
+	gatewaySynced      cache.InformerSynced
 
 	workqueue workqueue.RateLimitingInterface
 	recorder  record.EventRecorder
@@ -57,7 +59,8 @@ func NewController(
 	ctx context.Context,
 	kubeclientset kubernetes.Interface,
 	gatewayclientset clientset.Interface,
-	gatewayClassInformer informers.GatewayClassInformer) *Controller {
+	gatewayClassInformer informers.GatewayClassInformer,
+	gatewayInformer informers.GatewayInformer) *Controller {
 
 	utilruntime.Must(v1.AddToScheme(scheme.Scheme))
 	logger := klog.FromContext(ctx)
@@ -78,15 +81,24 @@ func NewController(
 		gatewayclientset:   gatewayclientset,
 		gatewayClassLister: listers.NewGatewayClassLister(gatewayClassInformer.Informer().GetIndexer()),
 		gatewayClassSynced: gatewayClassInformer.Informer().HasSynced,
+		gatewayLister:      listers.NewGatewayLister(gatewayInformer.Informer().GetIndexer()),
+		gatewaySynced:      gatewayInformer.Informer().HasSynced,
 		workqueue:          workqueue.NewRateLimitingQueue(ratelimiter),
 		recorder:           recorder,
 	}
 
 	logger.Info("Setting up event handlers")
 	gatewayClassInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueGatewayClass,
+		AddFunc: controller.enqueueEvent,
 		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueGatewayClass(new)
+			controller.enqueueEvent(new)
+		},
+	})
+
+	gatewayInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.enqueueEvent,
+		UpdateFunc: func(old, new interface{}) {
+			controller.enqueueEvent(new)
 		},
 	})
 
@@ -249,7 +261,7 @@ func (c *Controller) updateGatewayClassStatus(gc *v1.GatewayClass) error {
 	}
 }
 
-func (c *Controller) enqueueGatewayClass(obj interface{}) {
+func (c *Controller) enqueueEvent(obj interface{}) {
 	var key string
 	var err error
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
