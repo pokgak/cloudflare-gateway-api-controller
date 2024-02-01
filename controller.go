@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"time"
 
+	"github.com/cloudflare/cloudflare-go"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -40,9 +43,23 @@ const (
 	// MessageResourceSynced is the message used for an Event fired when a Foo
 	// is synced successfully
 	MessageResourceSynced = "Resource synced successfully"
+
+	GatewayClass = "GatewayClass"
+	Gateway      = "Gateway"
+	HTTPRoute    = "HTTPRoute"
 )
 
+var (
+	CloudflareAccountIdentifier = cloudflare.AccountIdentifier("d572f4f92aebab4f66ceb1004be4d164")
+)
+
+type WorkqueueItem struct {
+	Kind string
+	Key  string
+}
+
 type Controller struct {
+	cloudflareApi    *cloudflare.API
 	kubeclientset    kubernetes.Interface
 	gatewayclientset clientset.Interface
 
@@ -57,6 +74,7 @@ type Controller struct {
 
 func NewController(
 	ctx context.Context,
+	cloudflareApi *cloudflare.API,
 	kubeclientset kubernetes.Interface,
 	gatewayclientset clientset.Interface,
 	gatewayClassInformer informers.GatewayClassInformer,
@@ -77,6 +95,7 @@ func NewController(
 	)
 
 	controller := &Controller{
+		cloudflareApi:      cloudflareApi,
 		kubeclientset:      kubeclientset,
 		gatewayclientset:   gatewayclientset,
 		gatewayClassLister: listers.NewGatewayClassLister(gatewayClassInformer.Informer().GetIndexer()),
@@ -89,16 +108,20 @@ func NewController(
 
 	logger.Info("Setting up event handlers")
 	gatewayClassInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueEvent,
+		AddFunc: func(obj interface{}) {
+			controller.enqueueEvent(obj, GatewayClass)
+		},
 		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueEvent(new)
+			controller.enqueueEvent(new, GatewayClass)
 		},
 	})
 
 	gatewayInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueEvent,
+		AddFunc: func(obj interface{}) {
+			controller.enqueueEvent(obj, Gateway)
+		},
 		UpdateFunc: func(old, new interface{}) {
-			controller.enqueueEvent(new)
+			controller.enqueueEvent(new, Gateway)
 		},
 	})
 
@@ -156,32 +179,32 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 		// put back on the workqueue and attempted again after a back-off
 		// period.
 		defer c.workqueue.Done(obj)
-		var key string
+		var item WorkqueueItem
 		var ok bool
 		// We expect strings to come off the workqueue. These are of the
 		// form namespace/name. We do this as the delayed nature of the
 		// workqueue means the items in the informer cache may actually be
 		// more up to date that when the item was initially put onto the
 		// workqueue.
-		if key, ok = obj.(string); !ok {
+		if item, ok = obj.(WorkqueueItem); !ok {
 			// As the item in the workqueue is actually invalid, we call
 			// Forget here else we'd go into a loop of attempting to
 			// process a work item that is invalid.
 			c.workqueue.Forget(obj)
-			utilruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			utilruntime.HandleError(fmt.Errorf("expected WorkqueuItem in workqueue but got %#v", obj))
 			return nil
 		}
 		// Run the syncHandler, passing it the namespace/name string of the
-		// Foo resource to be synced.
-		if err := c.syncHandler(ctx, key); err != nil {
+		// resource to be synced.
+		if err := c.syncHandler(ctx, item); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
-			c.workqueue.AddRateLimited(key)
-			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
+			c.workqueue.AddRateLimited(item)
+			return fmt.Errorf("error syncing '%s': %s, requeuing", item.Key, err.Error())
 		}
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
 		c.workqueue.Forget(obj)
-		logger.Info("Successfully synced", "resourceName", key)
+		logger.Info("Successfully synced", "resourceName", item.Key)
 		return nil
 	}(obj)
 
@@ -196,43 +219,146 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Status block of the Foo resource
 // with the current status of the resource.
-func (c *Controller) syncHandler(ctx context.Context, key string) error {
+func (c *Controller) syncHandler(ctx context.Context, item WorkqueueItem) error {
+	logger := klog.FromContext(ctx)
+
 	// Convert the namespace/name string into a distinct namespace and name
 	// logger := klog.LoggerWithValues(klog.FromContext(ctx), "resourceName", key)
 
-	_, name, err := cache.SplitMetaNamespaceKey(key)
+	ns, name, err := cache.SplitMetaNamespaceKey(item.Key)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", item.Key))
 		return nil
 	}
 
-	// Get the GatewayClass resource with this namespace/name
-	gc, err := c.gatewayClassLister.Get(name)
-	if err != nil {
-		// The GatewayClass resource may no longer exist, in which case we stop
-		// processing.
-		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("gatewayclass '%s' in work queue no longer exists", key))
+	if ns == "" {
+		// Get the GatewayClass resource with this name
+		gc, err := c.gatewayClassLister.Get(name)
+		if err != nil {
+			// The GatewayClass resource may no longer exist, in which case we stop
+			// processing.
+			if errors.IsNotFound(err) {
+				utilruntime.HandleError(fmt.Errorf("resource '%s' '%s' in work queue no longer exists", item.Kind, item.Key))
+				return nil
+			}
+
+			return err
+		}
+
+		// skip update if no changes to the resource
+		if gc.Status.Conditions[len(gc.Status.Conditions)-1].ObservedGeneration == gc.Generation {
 			return nil
 		}
 
-		return err
-	}
+		// Finally, we update the status block of the Foo resource to reflect the
+		// current state of the world
+		err = c.updateGatewayClassStatus(gc)
+		if err != nil {
+			return err
+		}
 
-	// skip update if no changes to the resource
-	if gc.Status.Conditions[len(gc.Status.Conditions)-1].ObservedGeneration == gc.Generation {
-		return nil
-	}
+		c.recorder.Event(gc, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
+	} else {
+		logger.Info("received Gateway event", "namespace", ns, "name", name)
 
-	// Finally, we update the status block of the Foo resource to reflect the
-	// current state of the world
-	err = c.updateGatewayClassStatus(gc)
-	if err != nil {
-		return err
-	}
+		switch item.Kind {
+		case Gateway:
+			g, err := c.gatewayLister.Gateways(ns).Get(name)
+			if err != nil {
+				// The Gateway resource may no longer exist, in which case we stop
+				// processing.
+				if errors.IsNotFound(err) {
+					utilruntime.HandleError(fmt.Errorf("resource '%s' '%s' in work queue no longer exists", item.Kind, item.Key))
+					return nil
+				}
 
-	c.recorder.Event(gc, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
+				return err
+			}
+
+			// skip update if no changes to the resource
+			if g.Status.Conditions[len(g.Status.Conditions)-1].ObservedGeneration == g.Generation {
+				return nil
+			}
+
+			if tunnelId, ok := g.GetAnnotations()["cloudflare.com/tunnel-id"]; ok {
+				logger.Info("Gateway resource", "namespace", g.Namespace, "name", g.Name, "generation", g.Generation, "tunnelId", tunnelId)
+
+				logger.Info("Tunnel exists, checking status")
+				tunnel, err := c.cloudflareApi.GetTunnel(ctx, CloudflareAccountIdentifier, tunnelId)
+				if err != nil {
+					logger.Info("Failed to get tunnel", "id", tunnelId, "error", err)
+					return err
+				}
+				logger.Info("Tunnel", "id", tunnel.ID, "name", tunnel.Name, "status", tunnel.Status)
+
+				logger.Info("Gateway status", g.Status.Conditions[len(g.Status.Conditions)-1].String())
+			} else {
+				logger.Info("Tunnel does not exist, creating")
+
+				// generate a random 32-byte, base64-encoded random string
+				tunnelSecret, err := generateTunnelSecret()
+				if err != nil {
+					logger.Error(err, "Failed to generate tunnel secret")
+					return err
+				}
+
+				params := cloudflare.TunnelCreateParams{
+					Name:      g.Name,
+					Secret:    tunnelSecret,
+					ConfigSrc: "cloudflare",
+				}
+
+				tunnel, err := c.cloudflareApi.CreateTunnel(ctx, CloudflareAccountIdentifier, params)
+				if err != nil {
+					logger.Error(err, "Failed to create tunnel")
+					return err
+				}
+
+				logger.Info("Tunnel created", "id", tunnel.ID, "name", tunnel.Name, "status", tunnel.Status)
+				logger.Info("Updating Gateway resource with tunnel id", tunnel.ID)
+
+				gCopy := g.DeepCopy()
+				gCopy.Annotations["cloudflare.com/tunnel-id"] = tunnel.ID
+				gCopy.Annotations["cloudflare.com/tunnel-secret"] = tunnelSecret
+
+				conditionAccepted := metav1.Condition{
+					Status:             metav1.ConditionTrue,
+					Type:               string(v1.GatewayConditionAccepted),
+					Reason:             string(v1.GatewayReasonAccepted),
+					ObservedGeneration: gCopy.Generation,
+					LastTransitionTime: metav1.Now(),
+				}
+
+				conditionProgrammed := metav1.Condition{
+					Status:             metav1.ConditionTrue,
+					Type:               string(v1.GatewayConditionProgrammed),
+					Reason:             string(v1.GatewayReasonAccepted),
+					ObservedGeneration: gCopy.Generation,
+					LastTransitionTime: metav1.Now(),
+				}
+				gCopy.Status.Conditions = append(gCopy.Status.Conditions, conditionAccepted, conditionProgrammed)
+
+				logger.Info("Gateway status", gCopy.Status.Conditions[len(gCopy.Status.Conditions)-1].String())
+
+				_, err = c.gatewayclientset.GatewayV1().Gateways(gCopy.Namespace).Update(context.Background(), gCopy, metav1.UpdateOptions{})
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+	}
 	return nil
+}
+
+func generateTunnelSecret() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 func (c *Controller) updateGatewayClassStatus(gc *v1.GatewayClass) error {
@@ -261,12 +387,18 @@ func (c *Controller) updateGatewayClassStatus(gc *v1.GatewayClass) error {
 	}
 }
 
-func (c *Controller) enqueueEvent(obj interface{}) {
+func (c *Controller) enqueueEvent(obj interface{}, kind string) {
 	var key string
 	var err error
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
 	}
-	c.workqueue.Add(key)
+
+	item := WorkqueueItem{
+		Kind: kind,
+		Key:  key,
+	}
+
+	c.workqueue.Add(item)
 }

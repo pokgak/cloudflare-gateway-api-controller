@@ -2,8 +2,10 @@ package main
 
 import (
 	"flag"
+	"os"
 	"time"
 
+	"github.com/cloudflare/cloudflare-go"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	klog "k8s.io/klog/v2"
@@ -24,6 +26,14 @@ func main() {
 	ctx := signals.SetupSignalHandler()
 	logger := klog.FromContext(ctx)
 
+	logger.Info("Initializing cloudflare client")
+	cloudflareApi, err := cloudflare.NewWithAPIToken(os.Getenv("CLOUDFLARE_TOKEN"))
+	if err != nil {
+		logger.Error(err, "Error initializing cloudflare client")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
+
+	logger.Info("Initializing kube client")
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
 		logger.Error(err, "Error building kubeconfig")
@@ -45,7 +55,9 @@ func main() {
 	informerFactory := informers.NewSharedInformerFactory(clientset, time.Second*30)
 
 	controller := NewController(
-		ctx, kubeClient, clientset, 
+		ctx,
+		cloudflareApi,
+		kubeClient, clientset,
 		informerFactory.Gateway().V1().GatewayClasses(),
 		informerFactory.Gateway().V1().Gateways(),
 	)
