@@ -36,6 +36,7 @@ import (
 
 	gatewayapischeme "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/cloudflare/cloudflare-go"
 	"github.com/pokgak/cloudflare-gateway-api-controller/internal/controller"
 	//+kubebuilder:scaffold:imports
 )
@@ -123,6 +124,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	cloudflareClient, err := cloudflare.NewWithAPIToken(os.Getenv("CLOUDFLARE_API_TOKEN"))
+	if err != nil {
+		setupLog.Error(err, "unable to create cloudflare client")
+		os.Exit(1)
+	}
+
 	if err = (&controller.GatewayClassReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -131,8 +138,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controller.GatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:              mgr.GetClient(),
+		CloudflareAccountId: os.Getenv("CLOUDFLARE_ACCOUNT_ID"),
+		CloudflareClient:    cloudflareClient,
+		Scheme:              mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Gateway")
 		os.Exit(1)
